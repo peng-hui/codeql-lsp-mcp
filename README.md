@@ -42,7 +42,7 @@ args = ["/path/to/codeql-lsp-mcp/dist/index.js"]
 ```
 
 ### Logging 
-If you would like to enable logging, in the [LSP client](src/codeql-lsp-client.ts#L47) you can set `this.verbose = true;`.
+If you would like to enable logging, in the [LSP client](src/codeql-lsp-client.ts#L49) you can set `this.verbose = true;`.
 
 ## Tools
 
