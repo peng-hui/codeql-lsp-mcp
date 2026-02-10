@@ -1,9 +1,8 @@
 # CodeQL LSP MCP Server
 
-A Model Context Protocol (MCP) server that wraps the CodeQL Language Server Protocol (LSP) to enable LLM agents to write CodeQL queries with intelligent code completion, hover information, and other language features. This server reuses key concepts from the VS Code CodeQL extension to provide a robust language server interface. This is different from a MCP server that wraps the CodeQL CLI tool. However, you can also add CodeQL CLI commands to the server too. 
+A Model Context Protocol (MCP) server that wraps the CodeQL Language Server Protocol (LSP) to enable LLM agents to write CodeQL queries with intelligent code completion, hover information, and other language features. This server reuses key concepts from the VS Code CodeQL extension to provide a robust language server interface. This is different from a MCP server that wraps the CodeQL CLI tool. However, you can also add CodeQL CLI commands to the server too. Feel free to contribute. 
 - [Installation](#installation)
-- [Tools](#available-tools)
-- [Contributing](#contributing)
+- [Tools](#tools)
 - [Citation](#citation)
 
 ## Installation
@@ -41,6 +40,9 @@ Add to your MCP client configuration:
 command = "node"
 args = ["/home/path-to/codeql-lsp-mcp/dist/index.js"]
 ```
+
+### Logging 
+If you would like to enable logging, in the [LSP client](src/codeql-lsp-client.ts#L47) you can set `this.verbose = true;`.
 
 ## Tools
 
@@ -166,26 +168,6 @@ Set workspace folders for better CodeQL analysis.
   }
 }
 ```
-
-### 10. `codeql_compile`
-Compile a CodeQL query to check for syntax errors and get compilation diagnostics.
-
-```json
-{
-  "tool": "codeql_compile",
-  "arguments": {
-    "query_path": "/path/to/query.ql",
-    "database_path": "/path/to/codeql/database",
-    "output_path": "/path/to/compiled/query",
-    "additional_args": ["--verbose"]
-  }
-}
-```
-## Contributing
-We are always open to improvements. Feel free to make a PR. 
-
-### Adding a Tool 
-Here is how you can add a tool for extra CodeQL functionality.
 
 ## Citation 
 This MCP server was developed as part of the framework for our paper [QLCoder](https://arxiv.org/abs/2511.08462). Consider citing our paper. 
