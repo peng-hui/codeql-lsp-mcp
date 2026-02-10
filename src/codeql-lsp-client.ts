@@ -476,9 +476,8 @@ export class CodeQLLanguageServer {
     }
 
     /**
-     * Get diagnostics for a document using event-based waiting.
-     * Returns immediately if diagnostics are cached, otherwise waits for
-     * the publishDiagnostics notification.
+     * Get diagnostics for a document.
+     * Waits for the publishDiagnostics notification from the language server.
      */
     async getDiagnostics(uri: string, timeoutMs: number = 90000): Promise<Diagnostic[]> {
         this.log(`getDiagnostics() called for ${uri}`);
