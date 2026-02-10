@@ -29,7 +29,7 @@ Add to your MCP client configuration:
     "mcpServers": {
       "codeql": {
         "command": "node",
-        "args": ["/path/to/codeql-lsp-mcp/dist/index.js"], 
+        "args": ["/path/to/codeql-lsp-mcp/dist/index.js"] 
       }
     }
   }

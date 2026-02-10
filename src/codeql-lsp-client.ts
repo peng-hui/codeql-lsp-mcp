@@ -31,17 +31,19 @@ export interface CodeQLClientOptions {
     verbose?: boolean;
 }
 
+type DiagnosticsHandler = (params: PublishDiagnosticsParams) => void;
+
 export class CodeQLLanguageServer {
     private process: ChildProcessWithoutNullStreams | null = null;
     private connection: MessageConnection | null = null;
-    private diagnosticsMap: Map<string, Diagnostic[]> = new Map();
     private documentVersions: Map<string, number> = new Map();
     private workspaceFolders: string[] = [];
-    private keepaliveInterval?: NodeJS.Timeout;
     private readonly instanceId: string = `${process.pid}-${Date.now()}`;
     private readonly logFilePath: string | null = null;
     private readonly verbose: boolean;
     private codeqlPath?: string;
+
+    private diagnosticsListeners: Map<string, DiagnosticsHandler[]> = new Map();
 
     constructor(options: CodeQLClientOptions = {}) {
         this.verbose = options.verbose ?? false;
@@ -112,7 +114,10 @@ export class CodeQLLanguageServer {
         this.log(`start() called with workspace folders: ${JSON.stringify(workspaceFolders)}`);
 
         if (this.process) {
-            this.log(`Already started, returning early`);
+            this.log(`Already started`);
+            if (workspaceFolders && workspaceFolders.length > 0) {
+                await this.setWorkspaceFolders(workspaceFolders);
+            }
             return;
         }
 
@@ -167,7 +172,6 @@ export class CodeQLLanguageServer {
 
         this.log(`Message connection created`);
 
-        // Handle diagnostics
         this.connection.onNotification(
             "textDocument/publishDiagnostics",
             (params: PublishDiagnosticsParams) => {
@@ -175,7 +179,16 @@ export class CodeQLLanguageServer {
                 if (params.diagnostics.length > 0) {
                     this.log(`First diagnostic: ${JSON.stringify(params.diagnostics[0])}`);
                 }
-                this.diagnosticsMap.set(params.uri, params.diagnostics);
+
+                // Notify listeners when we have diagnostics 
+                const listeners = this.diagnosticsListeners.get(params.uri);
+                if (listeners && listeners.length > 0 && params.diagnostics.length > 0) {
+                    this.log(`Notifying ${listeners.length} listener(s) for ${params.uri}`);
+                    for (const listener of listeners) {
+                        listener(params);
+                    }
+                    this.diagnosticsListeners.delete(params.uri);
+                }
             }
         );
 
@@ -230,43 +243,18 @@ export class CodeQLLanguageServer {
         this.log(`Sending initialize request with params:`);
         this.log(`Init params: ${JSON.stringify(initParams, null, 2)}`);
 
-        this.connection.sendRequest("initialize", initParams)
-            .then(result => this.log(`Initialize response received: ${JSON.stringify(result)}`))
-            .catch(err => this.log(`Initialize request failed: ${err}`));
+        const initResult = await this.connection.sendRequest("initialize", initParams);
+        this.log(`Initialize response received: ${JSON.stringify(initResult)}`);
 
-        setTimeout(() => {
-            this.log(`Sending initialized notification`);
-            this.connection?.sendNotification("initialized", {})
-                .then(() => this.log(`Initialized notification sent`))
-                .catch(err => this.log(`Initialized notification failed: ${err}`));
-            this.log(`Initialization complete`);
-        }, 1000);
-
-        this.startKeepalive();
+        this.log(`Sending initialized notification`);
+        await this.connection.sendNotification("initialized", {});
+        this.log(`Initialized notification sent`);
 
         this.log("CodeQL language server initialized successfully");
     }
 
-    private startKeepalive(): void {
-        // Send a lightweight request every 60 seconds to keep the connection alive
-        this.keepaliveInterval = setInterval(async () => {
-            if (this.connection) {
-                try {
-                    await this.connection.sendRequest("$/cancelRequest", { id: -1 });
-                } catch (error) {
-                }
-            }
-        }, 60000);
-    }
-
     async stop(): Promise<void> {
         this.log(`stop() called`);
-
-        if (this.keepaliveInterval) {
-            this.log(`Clearing keepalive interval`);
-            clearInterval(this.keepaliveInterval);
-            this.keepaliveInterval = undefined;
-        }
 
         if (this.connection) {
             this.log(`Sending shutdown request`);
@@ -329,7 +317,6 @@ export class CodeQLLanguageServer {
         });
         this.log(`textDocument/codeQLDidChangeVisibleFiles sent`);
 
-        // Use EXACT same logic as updateDocument
         this.log(`Sending didChange to trigger analysis (using updateDocument logic)`);
 
         // Get the version that was just set above (should be 1), then increment like updateDocument does
@@ -448,49 +435,23 @@ export class CodeQLLanguageServer {
             position: { line, character },
         };
 
-        // Poll for hover information with exponential backoff
-        const maxWaitTime = 60000; // 30 seconds max for hover 
-        const pollInterval = 500; // Start with 500ms
-        let totalWaited = 0;
-        let currentInterval = pollInterval;
-        let pollCount = 0;
+        try {
+            const result = await this.connection.sendRequest<Hover | null>(
+                "textDocument/hover",
+                params
+            );
 
-        while (totalWaited < maxWaitTime) {
-            this.log(`Hover attempt ${++pollCount}, waiting ${currentInterval}ms...`);
-
-            try {
-                const result = await this.connection.sendRequest<Hover | null>(
-                    "textDocument/hover",
-                    params
-                );
-
-                if (result && result.contents) {
-                    this.log(`Hover found after ${totalWaited}ms!`);
-                    this.log(`Hover content: ${JSON.stringify(result.contents).substring(0, 100)}...`);
-                    return result;
-                }
-
-                this.log(`After ${totalWaited}ms: No hover content yet`);
-
-                // If no result, wait and try again
-                await new Promise(resolve => setTimeout(resolve, currentInterval));
-                totalWaited += currentInterval;
-
-                // Exponential backoff: 500ms, 1s, 2s, 2s, etc
-                currentInterval = Math.min(currentInterval * 2, 2000);
-
-            } catch (error) {
-                this.log(`Hover request failed: ${error instanceof Error ? error.message : String(error)}`);
-
-                // Wait and try again
-                await new Promise(resolve => setTimeout(resolve, currentInterval));
-                totalWaited += currentInterval;
-                currentInterval = Math.min(currentInterval * 2, 2000);
+            if (result && result.contents) {
+                this.log(`Hover found: ${JSON.stringify(result.contents).substring(0, 100)}...`);
+                return result;
             }
-        }
 
-        this.log(`No hover found after ${totalWaited}ms - returning null`);
-        return null;
+            this.log(`No hover content available`);
+            return null;
+        } catch (error) {
+            this.log(`Hover request failed: ${error instanceof Error ? error.message : String(error)}`);
+            return null;
+        }
     }
 
     async getDefinition(
@@ -514,7 +475,12 @@ export class CodeQLLanguageServer {
         return result;
     }
 
-    async getDiagnostics(uri: string): Promise<Diagnostic[]> {
+    /**
+     * Get diagnostics for a document using event-based waiting.
+     * Returns immediately if diagnostics are cached, otherwise waits for
+     * the publishDiagnostics notification.
+     */
+    async getDiagnostics(uri: string, timeoutMs: number = 90000): Promise<Diagnostic[]> {
         this.log(`getDiagnostics() called for ${uri}`);
 
         if (!this.connection) {
@@ -522,47 +488,39 @@ export class CodeQLLanguageServer {
             throw new Error("Language server not started");
         }
 
-        this.log(`Connection status: ${this.connection ? 'connected' : 'disconnected'}`);
-        this.log(`Process PID: ${this.process?.pid || 'none'}`);
+        this.log(`Waiting for publishDiagnostics notification...`);
 
-        let diagnostics = this.diagnosticsMap.get(uri) || [];
-        this.log(`Immediate check: ${diagnostics.length} diagnostics in cache`);
+        // Wait for the diagnostics notification
+        return new Promise<Diagnostic[]>((resolve, reject) => {
+            const startTime = Date.now();
 
-        if (diagnostics.length > 0) {
-            this.log(`Returning cached diagnostics`);
-            return diagnostics;
-        }
+            const timeout = setTimeout(() => {
+                const listeners = this.diagnosticsListeners.get(uri);
+                if (listeners) {
+                    const idx = listeners.indexOf(handler);
+                    if (idx >= 0) listeners.splice(idx, 1);
+                    if (listeners.length === 0) this.diagnosticsListeners.delete(uri);
+                }
 
-        this.log(`Starting polling for diagnostics...`);
+                const elapsed = Date.now() - startTime;
+                this.log(`Timeout after ${elapsed}ms waiting for diagnostics`);
+                reject(new Error(`Timeout waiting for diagnostics after ${elapsed}ms`));
+            }, timeoutMs);
 
-        // Poll for diagnostics with exponential backoff
-        const maxWaitTime = 120000; // 2 minutes max - CodeQL needs time to index workspace
-        const pollInterval = 1000; // Start with 1 second - be more patient
-        let totalWaited = 0;
-        let currentInterval = pollInterval;
-        let pollCount = 0;
+            const handler: DiagnosticsHandler = (params) => {
+                clearTimeout(timeout);
+                const elapsed = Date.now() - startTime;
+                this.log(`Diagnostics received after ${elapsed}ms: ${params.diagnostics.length} items`);
+                resolve(params.diagnostics);
+            };
 
-        while (totalWaited < maxWaitTime) {
-            this.log(`Polling attempt ${++pollCount}, waiting ${currentInterval}ms...`);
-            await new Promise(resolve => setTimeout(resolve, currentInterval));
-            totalWaited += currentInterval;
+            // Register our listener
+            const existing = this.diagnosticsListeners.get(uri) || [];
+            existing.push(handler);
+            this.diagnosticsListeners.set(uri, existing);
 
-            diagnostics = this.diagnosticsMap.get(uri) || [];
-            this.log(`After ${totalWaited}ms: ${diagnostics.length} diagnostics`);
-
-            if (diagnostics.length > 0) {
-                this.log(`Diagnostics found after ${totalWaited}ms!`);
-                this.log(`First diagnostic: ${JSON.stringify(diagnostics[0], null, 2)}`);
-                return diagnostics;
-            }
-
-            // Exponential backoff: 1s, 2s, 4s, 4s, etc
-            currentInterval = Math.min(currentInterval * 2, 4000);
-        }
-
-        this.log(`No diagnostics found after ${totalWaited}ms - returning empty`);
-        this.log(`Final state - Process alive: ${!!this.process}, Connection: ${!!this.connection}`);
-        return [];
+            this.log(`Registered diagnostics listener for ${uri}`);
+        });
     }
 
     async formatDocument(uri: string, range?: any): Promise<TextEdit[]> {
@@ -609,14 +567,45 @@ export class CodeQLLanguageServer {
         return result;
     }
 
-    setWorkspaceFolders(folders: string[]): void {
+    /**
+     * Update workspace folders without restarting the server.
+     * Sends workspace/didChangeWorkspaceFolders notification to the LSP.
+     */
+    async setWorkspaceFolders(folders: string[]): Promise<void> {
         this.log(`setWorkspaceFolders() called with: ${JSON.stringify(folders)}`);
         const oldFolders = [...this.workspaceFolders];
+
+        if (!this.connection) {
+            // Not started yet, just store for later
+            this.workspaceFolders = folders;
+            this.log(`Server not started, stored folders for later`);
+            return;
+        }
+
+        // Build the added/removed lists
+        const oldUris = oldFolders.map((f, i) => ({ uri: `file://${f}`, name: `workspace${i}` }));
+        const newUris = folders.map((f, i) => ({ uri: `file://${f}`, name: `workspace${i}` }));
+
+        this.log(`Sending workspace/didChangeWorkspaceFolders`);
+        this.log(`Removing: ${JSON.stringify(oldUris)}`);
+        this.log(`Adding: ${JSON.stringify(newUris)}`);
+
+        await this.connection.sendNotification("workspace/didChangeWorkspaceFolders", {
+            event: {
+                added: newUris,
+                removed: oldUris,
+            },
+        });
+
         this.workspaceFolders = folders;
-        this.log(`Workspace folders changed from ${JSON.stringify(oldFolders)} to ${JSON.stringify(folders)}`);
+        this.log(`Workspace folders updated successfully`);
     }
 
     getLogFilePath(): string | null {
         return this.logFilePath;
+    }
+
+    isRunning(): boolean {
+        return this.process !== null && !this.process.killed;
     }
 }

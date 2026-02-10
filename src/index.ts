@@ -430,14 +430,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "codeql_set_workspace": {
                 const folders = args.folders as string[];
 
-                // Stop existing server if running
-                if (codeqlServer) {
-                    await codeqlServer.stop();
-                }
-
-                // Create new server with workspace folders
-                codeqlServer = new CodeQLLanguageServer({ verbose: false });
-                await codeqlServer.start(folders);
+                await codeqlServer!.setWorkspaceFolders(folders);
 
                 return {
                     content: [
@@ -473,18 +466,17 @@ const cleanup = async () => {
     process.exit(0);
 };
 
-process.on("SIGINT", cleanup);
-process.on("SIGTERM", cleanup);
-process.on("exit", () => {
-    if (codeqlServer) {
-        try {
-            codeqlServer.stop();
-        } catch (e) {
-        }
-    }
-});
+process.on("SIGINT", () => { console.error("[SIGINT received]"); cleanup(); });
+process.on("SIGTERM", () => { console.error("[SIGTERM received]"); cleanup(); });
 
 const transport = new StdioServerTransport();
 server.connect(transport);
 console.error("CodeQL MCP Server started");
 console.error("To use this server, set CODEQL_PATH environment variable or ensure 'codeql' is in PATH");
+
+// Start CodeQL server eagerly to avoid cold start delay on first request
+ensureCodeQLServer().then(() => {
+    console.error("CodeQL language server ready");
+}).catch((err) => {
+    console.error(`Failed to pre-start CodeQL server: ${err}`);
+});
