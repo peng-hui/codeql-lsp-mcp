@@ -38,7 +38,7 @@ Add to your MCP client configuration:
 ```toml
 [mcp_servers.codeql]
 command = "node"
-args = ["/home/path-to/codeql-lsp-mcp/dist/index.js"]
+args = ["/path/to/codeql-lsp-mcp/dist/index.js"]
 ```
 
 ### Logging 
