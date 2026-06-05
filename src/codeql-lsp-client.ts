@@ -1,7 +1,5 @@
 import { spawn, ChildProcess, ChildProcessWithoutNullStreams } from "child_process";
 import {
-    createMessageConnection,
-    MessageConnection,
     InitializeParams,
     InitializeResult,
     CompletionParams,
@@ -20,7 +18,7 @@ import {
     VersionedTextDocumentIdentifier,
     TextDocumentContentChangeEvent,
 } from "vscode-languageserver-protocol";
-import { StreamMessageReader, StreamMessageWriter } from "vscode-jsonrpc/node.js";
+import { createMessageConnection, MessageConnection, StreamMessageReader, StreamMessageWriter } from "vscode-jsonrpc/node.js";
 import { existsSync, writeFileSync, appendFileSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join, delimiter } from "path";
@@ -44,6 +42,7 @@ export class CodeQLLanguageServer {
     private codeqlPath?: string;
 
     private diagnosticsListeners: Map<string, DiagnosticsHandler[]> = new Map();
+    private diagnosticsCache: Map<string, Diagnostic[]> = new Map();
 
     constructor(options: CodeQLClientOptions = {}) {
         this.verbose = options.verbose ?? false;
@@ -129,6 +128,11 @@ export class CodeQLLanguageServer {
         this.log(`Starting CodeQL language server with: ${this.codeqlPath}`);
 
         const args = ["execute", "language-server", "--check-errors", "ON_CHANGE"];
+        const searchPath = process.env.CODEQL_SEARCH_PATH;
+        if (searchPath) {
+            args.push(`--search-path=${searchPath}`);
+            this.log(`Using search path: ${searchPath}`);
+        }
         if (process.env.CODEQL_VERBOSE === "true") {
             args.push("-v");
         }
@@ -180,9 +184,12 @@ export class CodeQLLanguageServer {
                     this.log(`First diagnostic: ${JSON.stringify(params.diagnostics[0])}`);
                 }
 
-                // Notify listeners when we have diagnostics 
+                // Cache the result (including empty — means file is clean)
+                this.diagnosticsCache.set(params.uri, params.diagnostics);
+
+                // Notify all waiting listeners regardless of count
                 const listeners = this.diagnosticsListeners.get(params.uri);
-                if (listeners && listeners.length > 0 && params.diagnostics.length > 0) {
+                if (listeners && listeners.length > 0) {
                     this.log(`Notifying ${listeners.length} listener(s) for ${params.uri}`);
                     for (const listener of listeners) {
                         listener(params);
@@ -288,6 +295,7 @@ export class CodeQLLanguageServer {
     async openDocument(uri: string, content: string): Promise<void> {
         this.log(`openDocument() called for ${uri}`);
         this.log(`Content length: ${content.length} chars`);
+        this.diagnosticsCache.delete(uri);
 
         if (!this.connection) {
             this.log(`No connection available`);
@@ -345,6 +353,7 @@ export class CodeQLLanguageServer {
     async updateDocument(uri: string, content: string): Promise<void> {
         this.log(`updateDocument() called for ${uri}`);
         this.log(`Content length: ${content.length} chars`);
+        this.diagnosticsCache.delete(uri);
 
         if (!this.connection) {
             this.log(`No connection available`);
@@ -487,38 +496,58 @@ export class CodeQLLanguageServer {
             throw new Error("Language server not started");
         }
 
-        this.log(`Waiting for publishDiagnostics notification...`);
-
-        // Wait for the diagnostics notification
+        // Register listener BEFORE checking cache to avoid the race condition where
+        // the notification fires between the cache miss and listener registration.
         return new Promise<Diagnostic[]>((resolve, reject) => {
-            const startTime = Date.now();
-
-            const timeout = setTimeout(() => {
-                const listeners = this.diagnosticsListeners.get(uri);
-                if (listeners) {
-                    const idx = listeners.indexOf(handler);
-                    if (idx >= 0) listeners.splice(idx, 1);
-                    if (listeners.length === 0) this.diagnosticsListeners.delete(uri);
-                }
-
-                const elapsed = Date.now() - startTime;
-                this.log(`Timeout after ${elapsed}ms waiting for diagnostics`);
-                reject(new Error(`Timeout waiting for diagnostics after ${elapsed}ms`));
-            }, timeoutMs);
+            let resolved = false;
 
             const handler: DiagnosticsHandler = (params) => {
+                if (resolved) return;
+                resolved = true;
                 clearTimeout(timeout);
                 const elapsed = Date.now() - startTime;
                 this.log(`Diagnostics received after ${elapsed}ms: ${params.diagnostics.length} items`);
                 resolve(params.diagnostics);
             };
 
-            // Register our listener
             const existing = this.diagnosticsListeners.get(uri) || [];
             existing.push(handler);
             this.diagnosticsListeners.set(uri, existing);
-
             this.log(`Registered diagnostics listener for ${uri}`);
+
+            // Check cache after registering — safe because the notification handler
+            // always updates the cache and then calls listeners, so if the cache is
+            // populated the listener will fire (or has already fired and we catch it here).
+            const cached = this.diagnosticsCache.get(uri);
+            if (cached !== undefined) {
+                this.log(`Returning cached diagnostics (${cached.length} items)`);
+                resolved = true;
+                const listeners = this.diagnosticsListeners.get(uri);
+                if (listeners) {
+                    const idx = listeners.indexOf(handler);
+                    if (idx >= 0) listeners.splice(idx, 1);
+                    if (listeners.length === 0) this.diagnosticsListeners.delete(uri);
+                }
+                resolve(cached);
+                return;
+            }
+
+            const startTime = Date.now();
+            this.log(`No cached diagnostics, waiting for publishDiagnostics notification...`);
+
+            const timeout = setTimeout(() => {
+                if (resolved) return;
+                resolved = true;
+                const listeners = this.diagnosticsListeners.get(uri);
+                if (listeners) {
+                    const idx = listeners.indexOf(handler);
+                    if (idx >= 0) listeners.splice(idx, 1);
+                    if (listeners.length === 0) this.diagnosticsListeners.delete(uri);
+                }
+                const elapsed = Date.now() - startTime;
+                this.log(`Timeout after ${elapsed}ms waiting for diagnostics`);
+                reject(new Error(`Timeout waiting for diagnostics after ${elapsed}ms`));
+            }, timeoutMs);
         });
     }
 

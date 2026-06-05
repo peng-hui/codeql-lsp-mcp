@@ -5,9 +5,11 @@ import {
     ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { CodeQLLanguageServer } from "./codeql-lsp-client.js";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 import { randomInt } from "crypto";
 import { hostname } from "os";
+import { existsSync } from "fs";
+import { join, delimiter } from "path";
 
 const instanceId = `${hostname()}-${process.pid}-${randomInt(10000)}`;
 
@@ -243,7 +245,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     },
                     required: ["folders"],
                 },
-            }
+            },
+            {
+                name: "codeql_compile",
+                description: "Compile-check a CodeQL query without running it. Faster than codeql_run_query for catching syntax and type errors.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        query_path: {
+                            type: "string",
+                            description: "Absolute path to the .ql query file",
+                        },
+                    },
+                    required: ["query_path"],
+                },
+            },
+            {
+                name: "codeql_run_query",
+                description: "Run a CodeQL query against a database and return results. " +
+                    "For FN/TP cases the query should produce results (vulnerability detected). " +
+                    "For FP/TN cases the query should produce no results (safe code, no false alarm).",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        query_path: {
+                            type: "string",
+                            description: "Absolute path to the .ql query file",
+                        },
+                        db_path: {
+                            type: "string",
+                            description: "Absolute path to the CodeQL database directory",
+                        },
+                        label: {
+                            type: "string",
+                            enum: ["fn", "fp", "tp", "tn"],
+                            description: "Expected label: fn/tp = should detect (results expected), fp/tn = should not detect (no results expected)",
+                        },
+                    },
+                    required: ["query_path", "db_path"],
+                },
+            },
         ],
     };
 });
@@ -440,6 +481,98 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         },
                     ],
                 };
+            }
+
+            case "codeql_compile": {
+                const queryPath = args.query_path as string;
+
+                if (!existsSync(queryPath)) {
+                    return { content: [{ type: "text", text: `Error: query file not found: ${queryPath}` }] };
+                }
+
+                const codeqlPath = process.env.CODEQL_PATH ||
+                    process.env.PATH?.split(delimiter).map(d => join(d, "codeql")).find(p => existsSync(p)) ||
+                    "codeql";
+                const searchPath = process.env.CODEQL_SEARCH_PATH;
+
+                const cmd = [codeqlPath, "query", "compile", "--check-only", queryPath];
+                if (searchPath) cmd.push("--search-path", searchPath);
+
+                try {
+                    execFileSync(cmd[0], cmd.slice(1), { timeout: 120000, encoding: "utf8" });
+                    return { content: [{ type: "text", text: "Compilation successful — no errors." }] };
+                } catch (e: any) {
+                    const stderr = e.stderr?.toString() || String(e);
+                    return { content: [{ type: "text", text: `Compilation failed:\n${stderr}` }] };
+                }
+            }
+
+            case "codeql_run_query": {
+                const queryPath = args.query_path as string;
+                const dbPath = args.db_path as string;
+                const label = args.label as string | undefined;
+
+                if (!existsSync(queryPath)) {
+                    return { content: [{ type: "text", text: `Error: query file not found: ${queryPath}` }] };
+                }
+                if (!existsSync(dbPath)) {
+                    return { content: [{ type: "text", text: `Error: database not found: ${dbPath}` }] };
+                }
+
+                const codeqlPath = process.env.CODEQL_PATH ||
+                    process.env.PATH?.split(delimiter).map(d => join(d, "codeql")).find(p => existsSync(p)) ||
+                    "codeql";
+                const searchPath = process.env.CODEQL_SEARCH_PATH;
+
+                const cmd = [codeqlPath, "query", "run", queryPath, "--database", dbPath];
+                if (searchPath) cmd.push("--search-path", searchPath);
+
+                let stdout = "";
+                let stderr = "";
+                let success = false;
+                try {
+                    stdout = execFileSync(cmd[0], cmd.slice(1), { timeout: 300000, encoding: "utf8" });
+                    success = true;
+                } catch (e: any) {
+                    stderr = e.stderr?.toString() || String(e);
+                    stdout = e.stdout?.toString() || "";
+                }
+
+                if (!success) {
+                    return { content: [{ type: "text", text: `Query execution failed:\n${stderr}` }] };
+                }
+
+                // Parse result locations (file://...path:line:col:line:col)
+                const resultLines: string[] = [];
+                for (const line of stdout.split("\n")) {
+                    if (line.includes("file://") || (line.trim() && !line.startsWith("Running"))) {
+                        resultLines.push(line);
+                    }
+                }
+
+                const hasResults = !stdout.includes("No results found") &&
+                    resultLines.some(l => l.includes("file://"));
+
+                // Verdict based on label
+                let verdict = "";
+                if (label) {
+                    const expectResults = label === "fn" || label === "tp";
+                    if (expectResults && hasResults) {
+                        verdict = "\nVERDICT: PASS — query correctly detects the vulnerability.";
+                    } else if (expectResults && !hasResults) {
+                        verdict = "\nVERDICT: FAIL — query misses the vulnerability (false negative). Fix needed.";
+                    } else if (!expectResults && !hasResults) {
+                        verdict = "\nVERDICT: PASS — query correctly produces no results on safe code.";
+                    } else {
+                        verdict = "\nVERDICT: FAIL — query falsely flags safe code (false positive). Fix needed.";
+                    }
+                }
+
+                const output = resultLines.length > 0
+                    ? `Results:\n${resultLines.join("\n")}`
+                    : "No results found.";
+
+                return { content: [{ type: "text", text: output + verdict }] };
             }
 
             default:
